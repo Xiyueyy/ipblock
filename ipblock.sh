@@ -136,10 +136,11 @@ fetch_or_cache() {
 }
 
 load_ipset() {
-  local family="$1" set="$2" file="$3" tmp_set="${set}_tmp"
+  local family="$1" set_name="$2" file="$3"
+  local tmp_set="${set_name}_tmp"
   [ -s "$file" ] || err "IP 列表为空：$file"
 
-  ipset create "$set" hash:net family "$family" hashsize 16384 maxelem 300000 -exist
+  ipset create "$set_name" hash:net family "$family" hashsize 16384 maxelem 300000 -exist
   ipset create "$tmp_set" hash:net family "$family" hashsize 16384 maxelem 300000 -exist
   ipset flush "$tmp_set"
 
@@ -152,9 +153,9 @@ load_ipset() {
     count=$((count + 1))
   done < "$file"
 
-  ipset swap "$tmp_set" "$set"
+  ipset swap "$tmp_set" "$set_name"
   ipset destroy "$tmp_set" 2>/dev/null || true
-  log "已加载 $set：$count 条"
+  log "已加载 $set_name：$count 条"
 }
 
 add_one_rule() {
