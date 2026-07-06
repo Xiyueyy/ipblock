@@ -60,7 +60,6 @@ jobs:
             -project 'Orange Cloud.xcodeproj' \
             -scheme 'Orange Cloud' \
             -configuration Release \
-            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             -skipPackagePluginValidation \
