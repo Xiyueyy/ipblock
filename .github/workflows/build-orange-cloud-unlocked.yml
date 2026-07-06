@@ -18,6 +18,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          path: workflow-repo
+          persist-credentials: true
+
       - name: Checkout Orange Cloud
         uses: actions/checkout@v4
         with:
@@ -28,25 +34,26 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          xcodebuild -version
-          xcodebuild -showsdks
+          mkdir -p workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}
+          xcodebuild -version | tee workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/xcode-version.log
+          xcodebuild -showsdks | tee -a workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/xcode-version.log
 
       - name: Resolve Swift packages
         shell: bash
         run: |
-          set -euxo pipefail
+          set -o pipefail
           cd 'orange-cloud/apps/ios/Orange Cloud'
           xcodebuild \
             -project 'Orange Cloud.xcodeproj' \
             -scheme 'Orange Cloud' \
             -resolvePackageDependencies \
             -skipPackagePluginValidation \
-            -skipMacroValidation
+            -skipMacroValidation 2>&1 | tee "$GITHUB_WORKSPACE/workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/resolve.log"
 
       - name: Build unsigned unlocked app
         shell: bash
         run: |
-          set -euxo pipefail
+          set -o pipefail
           cd 'orange-cloud/apps/ios/Orange Cloud'
           rm -rf build Payload "$IPA_NAME"
           xcodebuild build \
@@ -62,13 +69,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             OTHER_SWIFT_FLAGS='$(inherited) -D OPENSOURCE_UNLOCKED' \
-            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) OPENSOURCE_UNLOCKED'
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) OPENSOURCE_UNLOCKED' 2>&1 | tee "$GITHUB_WORKSPACE/workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/build.log"
 
           APP_PATH="$(find build -path '*Release-iphoneos/Orange Cloud.app' -type d | head -n 1)"
           if [ -z "$APP_PATH" ]; then
-            echo 'Orange Cloud.app not found'
-            find build -name '*.app' -type d -print
+            echo 'Orange Cloud.app not found' | tee -a "$GITHUB_WORKSPACE/workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/build.log"
+            find build -name '*.app' -type d -print | tee -a "$GITHUB_WORKSPACE/workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/build.log"
             exit 1
           fi
 
@@ -77,9 +85,10 @@ jobs:
           find Payload -name '_CodeSignature' -type d -prune -exec rm -rf {} + || true
           find Payload -name 'embedded.mobileprovision' -type f -delete || true
           /usr/bin/zip -qry "$IPA_NAME" Payload
-          ls -lh "$IPA_NAME"
+          ls -lh "$IPA_NAME" | tee -a "$GITHUB_WORKSPACE/workflow-repo/orange-cloud-build-logs/${GITHUB_RUN_ID}/build.log"
 
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: OrangeCloud-OpenSourceUnlocked-unsigned-ipa
@@ -87,6 +96,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
+        if: success()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,3 +109,16 @@ jobs:
             --title "Orange Cloud unlocked unsigned IPA $TAG" \
             --notes "Built from https://github.com/chen2he/orange-cloud with OPENSOURCE_UNLOCKED. Unsigned IPA for self-signing." \
             --latest=false
+
+      - name: Commit build logs
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd workflow-repo
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add orange-cloud-build-logs/${GITHUB_RUN_ID} || true
+          git diff --cached --quiet && exit 0
+          git commit -m "ci: orange cloud build logs ${GITHUB_RUN_ID}"
+          git push
