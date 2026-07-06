@@ -1,0 +1,101 @@
+name: Build Orange Cloud unlocked unsigned IPA
+
+on:
+  push:
+    branches:
+      - 'orange-cloud-build-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ORANGE_REPO: chen2he/orange-cloud
+  IPA_NAME: OrangeCloud-OpenSourceUnlocked-unsigned.ipa
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Orange Cloud
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORANGE_REPO }}
+          path: orange-cloud
+
+      - name: Xcode version
+        shell: bash
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd 'orange-cloud/apps/ios/Orange Cloud'
+          xcodebuild \
+            -project 'Orange Cloud.xcodeproj' \
+            -scheme 'Orange Cloud' \
+            -resolvePackageDependencies \
+            -skipPackagePluginValidation \
+            -skipMacroValidation
+
+      - name: Build unsigned unlocked app
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd 'orange-cloud/apps/ios/Orange Cloud'
+          rm -rf build Payload "$IPA_NAME"
+          xcodebuild build \
+            -project 'Orange Cloud.xcodeproj' \
+            -scheme 'Orange Cloud' \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            OTHER_SWIFT_FLAGS='$(inherited) -D OPENSOURCE_UNLOCKED' \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) OPENSOURCE_UNLOCKED'
+
+          APP_PATH="$(find build -path '*Release-iphoneos/Orange Cloud.app' -type d | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo 'Orange Cloud.app not found'
+            find build -name '*.app' -type d -print
+            exit 1
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          find Payload -name '_CodeSignature' -type d -prune -exec rm -rf {} + || true
+          find Payload -name 'embedded.mobileprovision' -type f -delete || true
+          /usr/bin/zip -qry "$IPA_NAME" Payload
+          ls -lh "$IPA_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeCloud-OpenSourceUnlocked-unsigned-ipa
+          path: orange-cloud/apps/ios/Orange Cloud/OrangeCloud-OpenSourceUnlocked-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          TAG="orange-cloud-unlocked-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          IPA='orange-cloud/apps/ios/Orange Cloud/OrangeCloud-OpenSourceUnlocked-unsigned.ipa'
+          gh release create "$TAG" "$IPA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Orange Cloud unlocked unsigned IPA $TAG" \
+            --notes "Built from https://github.com/chen2he/orange-cloud with OPENSOURCE_UNLOCKED. Unsigned IPA for self-signing." \
+            --latest=false
