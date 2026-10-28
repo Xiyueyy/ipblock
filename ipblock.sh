@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ipblock —— 按端口控制入站来源（nftables）：
 #   大陆屏蔽：指定端口丢弃中国大陆 IP 主动发起的连接，可放行大陆中转机等例外 IP
-#   端口白名单：指定端口只接受名单内 IP 的连接，每个端口一份名单
+#   端口白名单：指定端口只接受名单内 IP（或整个省份）的连接，每个端口一份名单
 # 只看"连进来"的新连接（conntrack 方向），本机访问外部的回包、其他端口都不受影响。
 # 在 prerouting 阶段（DNAT 之前）匹配，裸机监听和 Docker 映射端口都能拦。
 set -Eeuo pipefail
 
-VERSION="2026-10-27"
+VERSION="2026-10-28"
 APP="ipblock"
 BIN="/usr/local/sbin/${APP}"
 SCRIPT_URL="https://raw.githubusercontent.com/Xiyueyy/ipblock/main/ipblock.sh"
@@ -17,6 +17,7 @@ CN4_FILE="${BASE_DIR}/cn4.txt"
 CN6_FILE="${BASE_DIR}/cn6.txt"
 WL_PORTS="${BASE_DIR}/wl.ports"
 WL_DIR="${BASE_DIR}/wl"
+PROV_DIR="${BASE_DIR}/prov"
 NFT_TABLE="ipblock"
 UNIT_DIR="/etc/systemd/system"
 
@@ -25,6 +26,9 @@ UNIT_DIR="/etc/systemd/system"
 CN4_URL="${IPBLOCK_CN4_URL:-https://raw.githubusercontent.com/sapics/ip-location-db/main/geolite2-country/geolite2-country-ipv4.csv}"
 CN6_URL="${IPBLOCK_CN6_URL:-https://raw.githubusercontent.com/sapics/ip-location-db/main/geolite2-country/geolite2-country-ipv6.csv}"
 APNIC_URL="${IPBLOCK_APNIC_URL:-https://ftp.apnic.net/stats/apnic/delegated-apnic-latest}"
+# 省份/城市 IPv4 段（metowolf/iplist 的 cncity，按行政区划代码分文件，%s 替换成代码）；依次尝试，任一成功即可
+PROV_URLS="${IPBLOCK_PROV_URL:-https://metowolf.github.io/iplist/data/cncity/%s.txt https://testingcf.jsdelivr.net/gh/metowolf/iplist@master/data/cncity/%s.txt https://raw.githubusercontent.com/metowolf/iplist/master/data/cncity/%s.txt}"
+MIN_PROV_LINES=10
 MIN_CN4_LINES=1000
 MIN_CN6_LINES=200
 
@@ -47,19 +51,20 @@ ${APP} ${VERSION} —— 按端口屏蔽大陆来源 / 只放行白名单 IP（n
   ${APP} cn disallow <IP>...       移除例外
 
 端口白名单：
-  ${APP} wl add <端口> <IP>...     该端口只放行这些 IP（可多次执行追加）
-  ${APP} wl rm  <端口> <IP>...     从该端口名单里移除 IP
+  ${APP} wl add <端口> <IP|省份>...  该端口只放行这些 IP / 省份（可多次执行追加）
+  ${APP} wl rm  <端口> <IP|省份>...  从该端口名单里移除
   ${APP} wl del <端口>...          取消该端口的白名单
 
 其他：
   ${APP} status                    查看配置、IP 库和拦截计数
-  ${APP} update                    重新下载大陆 IP 库并生效（已设每周自动更新）
+  ${APP} update                    重新下载大陆 / 省份 IP 库并生效（已设每周自动更新）
   ${APP} off / on                  临时关闭 / 按配置恢复（重启后自动恢复）
   ${APP} import                    导入并替换旧的 cn-port-block / port-allowlist
   ${APP} uninstall                 删除全部规则、定时任务和配置
 
 端口写法：443、443/tcp、20000-20010/udp（不写协议 = TCP+UDP）
 IP 写法：1.2.3.4、1.2.3.0/24、2001:db8::/32
+省份写法：江西、广东省、内蒙古，或 6 位行政区划代码（如 360000 江西、360100 南昌），只含 IPv4
 EOF
 }
 
@@ -165,8 +170,37 @@ wl_file() { echo "${WL_DIR}/$1"; }
 wl_id() { echo "${1//-/_}"; }
 wl_port_list() { read_list "$WL_PORTS" | awk '!seen[$1]++ { print $1 }'; }
 wl_has_port() { read_list "$WL_PORTS" | awk -v p="$1" '$1 == p { f = 1 } END { exit !f }'; }
-v4_only() { awk '!/:/'; }
+v4_only() { awk '/\./ && !/:/'; }
 v6_only() { awk '/:/'; }
+prov_only() { awk '!/[.:]/'; }
+
+# 省份名 → 去掉"省/市/自治区"等后缀的简称；6 位代码原样返回；不认识返回失败
+prov_norm() {
+  local n="$1"
+  if [[ "$n" =~ ^[1-6][0-9]{5}$ ]]; then echo "$n"; return 0; fi
+  n="${n%省}"; n="${n%市}"; n="${n%自治区}"; n="${n%壮族}"; n="${n%回族}"; n="${n%维吾尔}"
+  prov_code "$n" >/dev/null && echo "$n"
+}
+
+prov_code() {
+  case "$1" in
+    北京) echo 110000 ;; 天津) echo 120000 ;; 河北) echo 130000 ;; 山西) echo 140000 ;; 内蒙古) echo 150000 ;;
+    辽宁) echo 210000 ;; 吉林) echo 220000 ;; 黑龙江) echo 230000 ;;
+    上海) echo 310000 ;; 江苏) echo 320000 ;; 浙江) echo 330000 ;; 安徽) echo 340000 ;; 福建) echo 350000 ;; 江西) echo 360000 ;; 山东) echo 370000 ;;
+    河南) echo 410000 ;; 湖北) echo 420000 ;; 湖南) echo 430000 ;; 广东) echo 440000 ;; 广西) echo 450000 ;; 海南) echo 460000 ;;
+    重庆) echo 500000 ;; 四川) echo 510000 ;; 贵州) echo 520000 ;; 云南) echo 530000 ;; 西藏) echo 540000 ;;
+    陕西) echo 610000 ;; 甘肃) echo 620000 ;; 青海) echo 630000 ;; 宁夏) echo 640000 ;; 新疆) echo 650000 ;;
+    *) [[ "$1" =~ ^[1-6][0-9]{5}$ ]] && echo "$1" || return 1 ;;
+  esac
+}
+
+prov_file() { echo "${PROV_DIR}/$(prov_code "$1").txt"; }
+
+# 所有端口名单里用到的省份（去重）
+used_provs() {
+  local port
+  for port in $(wl_port_list); do read_list "$(wl_file "$port")" | prov_only; done | awk '!seen[$0]++'
+}
 
 # ---------- 大陆 IP 库 ----------
 
@@ -211,6 +245,26 @@ fetch_cn_lists() {
   info "IP 库已更新：IPv4 $(wc -l <"$CN4_FILE") 段，IPv6 $(wc -l <"$CN6_FILE") 段"
 }
 
+fetch_prov() {
+  # $1 省份简称或代码；$2=keep 时下载失败沿用缓存
+  local name="$1" code dst tmp tpl
+  command -v curl >/dev/null 2>&1 || die "需要 curl"
+  code="$(prov_code "$name")"; dst="$(prov_file "$name")"
+  mkdir -p "$PROV_DIR"; tmp="$(mktemp)"
+  for tpl in $PROV_URLS; do
+    # shellcheck disable=SC2059
+    if curl -fsSL --retry 2 --connect-timeout 10 -m 60 "$(printf "$tpl" "$code")" 2>/dev/null \
+      | grep -E '^[0-9]+(\.[0-9]+){3}/[0-9]+$' >"$tmp" && [ "$(wc -l <"$tmp")" -ge "$MIN_PROV_LINES" ]; then
+      install -m 600 "$tmp" "$dst"; rm -f "$tmp"
+      info "${name} IP 库已更新：IPv4 $(wc -l <"$dst") 段"
+      return 0
+    fi
+  done
+  rm -f "$tmp"
+  if [ "${2:-}" = keep ] && [ -s "$dst" ]; then warn "${name} IP 库下载失败，继续使用本地缓存"; return 0; fi
+  die "${name} IP 库下载失败，请检查网络后重试"
+}
+
 # ---------- 规则 ----------
 
 set_block() {
@@ -223,7 +277,7 @@ set_block() {
 }
 
 build_ruleset() {
-  local port proto id
+  local port proto id p
   # 先建再删再建：整份文件原子生效，不会出现规则空窗。
   printf 'table inet %s {}\ndelete table inet %s\ntable inet %s {\n' "$NFT_TABLE" "$NFT_TABLE" "$NFT_TABLE"
 
@@ -237,6 +291,9 @@ build_ruleset() {
     id="$(wl_id "$port")"
     read_list "$(wl_file "$port")" | v4_only | set_block "wl_${id}_4" ipv4_addr
     read_list "$(wl_file "$port")" | v6_only | set_block "wl_${id}_6" ipv6_addr
+  done
+  for p in $(used_provs); do
+    set_block "prov_$(prov_code "$p")" ipv4_addr <"$(prov_file "$p")"
   done
 
   printf '  chain prerouting {\n    type filter hook prerouting priority -160; policy accept;\n'
@@ -257,7 +314,11 @@ build_ruleset() {
 EOF
   for port in $(wl_port_list); do
     id="$(wl_id "$port")"
-    printf '  chain wl_%s {\n    ip saddr @wl_%s_4 return\n    ip6 saddr @wl_%s_6 return\n    counter drop\n  }\n' "$id" "$id" "$id"
+    printf '  chain wl_%s {\n    ip saddr @wl_%s_4 return\n    ip6 saddr @wl_%s_6 return\n' "$id" "$id" "$id"
+    for p in $(read_list "$(wl_file "$port")" | prov_only); do
+      printf '    ip saddr @prov_%s return\n' "$(prov_code "$p")"
+    done
+    printf '    counter drop\n  }\n'
   done
   printf '}\n'
 }
@@ -272,6 +333,8 @@ apply_rules() {
   if [ -n "$(read_list "$CN_PORTS")" ] && [ ! -s "$CN4_FILE" ]; then
     fetch_cn_lists
   fi
+  local p
+  for p in $(used_provs); do [ -s "$(prov_file "$p")" ] || fetch_prov "$p"; done
   [ -e "$CN4_FILE" ] || : >"$CN4_FILE"
   [ -e "$CN6_FILE" ] || : >"$CN6_FILE"
 
@@ -317,7 +380,7 @@ WantedBy=multi-user.target
 EOF
   cat >"${UNIT_DIR}/${APP}-update.service" <<EOF
 [Unit]
-Description=ipblock: refresh mainland China IP list
+Description=ipblock: refresh mainland China / province IP lists
 After=network-online.target
 Wants=network-online.target
 
@@ -327,7 +390,7 @@ ExecStart=${BIN} update
 EOF
   cat >"${UNIT_DIR}/${APP}-update.timer" <<EOF
 [Unit]
-Description=ipblock: weekly refresh of mainland China IP list
+Description=ipblock: weekly refresh of mainland China / province IP lists
 
 [Timer]
 OnCalendar=weekly
@@ -463,27 +526,36 @@ cn_cmd() {
   show_status
 }
 
+# IP 原样返回，省份返回简称；都不是则报错
+wl_entry() {
+  valid_ip "$1" && { echo "$1"; return 0; }
+  prov_norm "$1" || die "既不是 IP 也不是省份：$1"
+}
+
 wl_cmd() {
-  local sub="${1:-}" spec port p line
+  local sub="${1:-}" spec port p line entries=()
   shift || true
   case "$sub" in
     add)
-      [ $# -ge 2 ] || die "用法：${APP} wl add <端口> <IP>..."
+      [ $# -ge 2 ] || die "用法：${APP} wl add <端口> <IP|省份>..."
       spec="$1"; shift; port="${spec%%/*}"
       parse_port "$spec" >/dev/null; refuse_ssh "$port"
-      for p in "$@"; do valid_ip "$p" || die "IP 格式不对：$p"; done
+      for p in "$@"; do entries+=("$(wl_entry "$p")"); done
+      for p in "${entries[@]}"; do
+        if ! valid_ip "$p" && [ ! -s "$(prov_file "$p")" ]; then fetch_prov "$p"; fi
+      done
       if wl_has_port "$port" && [[ "$spec" == */* ]]; then
         warn "端口 $port 已有白名单，协议以首次添加为准；要改协议请先 ${APP} wl del $port"
       else
         parse_port "$spec" | while read -r line; do add_unique "$WL_PORTS" "$line"; done
       fi
-      for p in "$@"; do add_unique "$(wl_file "$port")" "$p"; done
+      for p in "${entries[@]}"; do add_unique "$(wl_file "$port")" "$p"; done
       apply_rules; install_units ;;
     rm)
-      [ $# -ge 2 ] || die "用法：${APP} wl rm <端口> <IP>..."
+      [ $# -ge 2 ] || die "用法：${APP} wl rm <端口> <IP|省份>..."
       port="${1%%/*}"; shift
       wl_has_port "$port" || die "端口 $port 没有白名单"
-      for p in "$@"; do remove_line "$(wl_file "$port")" "$p"; done
+      for p in "$@"; do remove_line "$(wl_file "$port")" "$(wl_entry "$p")"; done
       [ -n "$(read_list "$(wl_file "$port")")" ] || warn "端口 $port 的名单已空，所有来源都会被拦截；不需要了请用 ${APP} wl del $port"
       apply_rules ;;
     del)
@@ -505,7 +577,7 @@ chain_drops() {
 }
 
 show_status() {
-  local active=0 port ips allow
+  local active=0 port ips allow p
   nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && active=1
   echo
   printf '%s %s  状态：%s\n' "$APP" "$VERSION" "$([ "$active" -eq 1 ] && echo "${GREEN}生效中${NC}" || echo "${YELLOW}未生效${NC}")"
@@ -528,7 +600,9 @@ show_status() {
   echo "[端口白名单]"
   if [ -n "$(read_list "$WL_PORTS")" ]; then
     for port in $(wl_port_list); do
-      ips="$(read_list "$(wl_file "$port")" | paste -sd' ' -)"
+      ips="$(read_list "$(wl_file "$port")" | while read -r p; do
+        if valid_ip "$p"; then echo "$p"; else echo "${p}($(wc -l 2>/dev/null <"$(prov_file "$p")" || echo 0)段)"; fi
+      done | paste -sd' ' -)"
       printf '  %-12s 放行：%s' "$(read_list "$WL_PORTS" | awk -v p="$port" '$1 == p' | fmt_ports)" "${ips:-（无，全部拦截）}"
       [ "$active" -eq 1 ] && printf '  已拦截：%s 个包' "$(chain_drops "wl_$(wl_id "$port")")"
       echo
@@ -540,11 +614,14 @@ show_status() {
 }
 
 fetch_and_apply() {
-  if [ -z "$(read_list "$CN_PORTS")" ]; then
-    info "没有配置大陆屏蔽端口，跳过 IP 库更新"
+  local p provs
+  provs="$(used_provs)"
+  if [ -z "$(read_list "$CN_PORTS")" ] && [ -z "$provs" ]; then
+    info "没有配置大陆屏蔽端口或省份白名单，跳过 IP 库更新"
     return 0
   fi
-  fetch_cn_lists
+  [ -n "$(read_list "$CN_PORTS")" ] && fetch_cn_lists
+  for p in $provs; do fetch_prov "$p" keep; done
   apply_rules
 }
 
@@ -594,11 +671,11 @@ menu() {
  大陆屏蔽
   1) 添加端口            2) 删除端口
   3) 添加例外 IP         4) 移除例外 IP
- 端口白名单（只放行指定 IP）
+ 端口白名单（只放行指定 IP / 省份）
   5) 添加端口 / IP       6) 移除 IP
   7) 取消某端口白名单
  其他
-  8) 查看状态            9) 立即更新大陆 IP 库
+  8) 查看状态            9) 立即更新 IP 库
  10) 导入旧版 cn-port-block / port-allowlist
  11) 全部卸载            0) 退出
 MENU
@@ -608,8 +685,8 @@ MENU
       2) ask "要取消屏蔽的端口" "" a; run cn_cmd del $a ;;
       3) ask "例外 IP（空格分隔）" "" a; run cn_cmd allow $a ;;
       4) ask "要移除的例外 IP" "" a; run cn_cmd disallow $a ;;
-      5) ask "端口" "" a; ask "放行的 IP（空格分隔）" "" b; run wl_cmd add "$a" $b ;;
-      6) ask "端口" "" a; ask "要移除的 IP" "" b; run wl_cmd rm "$a" $b ;;
+      5) ask "端口" "" a; ask "放行的 IP 或省份（空格分隔，如 1.2.3.4 江西）" "" b; run wl_cmd add "$a" $b ;;
+      6) ask "端口" "" a; ask "要移除的 IP 或省份" "" b; run wl_cmd rm "$a" $b ;;
       7) ask "要取消白名单的端口" "" a; run wl_cmd del $a ;;
       8) run show_status ;;
       9) run fetch_and_apply ;;
