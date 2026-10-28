@@ -3,7 +3,7 @@
 按端口控制入站来源的一键脚本（nftables），两种功能可以同时用：
 
 - **大陆屏蔽**：指定端口丢弃中国大陆 IP 主动发起的连接，可以给大陆中转机等加例外；
-- **端口白名单**：指定端口只接受名单内 IP 或整个省份（如江西）的连接，每个端口一份名单。
+- **端口白名单**：指定端口只接受名单内 IP、整个省份（如江西）或域名（适合 DDNS 动态 IP）的连接，每个端口一份名单。
 
 特点：
 
@@ -34,6 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Xiyueyy/ipblock/main/install
 端口写法：`443`、`443/tcp`、`20000-20010/udp`（不写协议 = TCP+UDP）
 IP 写法：`1.2.3.4`、`1.2.3.0/24`、`2001:db8::/32`
 省份写法：`江西`、`广东省`、`内蒙古`，或 6 位行政区划代码（`360000` 江西、`360100` 南昌），只含 IPv4
+域名写法：`ddns.example.com`，解析出的 IPv4 / IPv6 都放行；名单里有域名时每 5 分钟重新解析一次，IP 变了自动更新规则，解析失败沿用上次结果
 
 ### 大陆屏蔽
 
@@ -49,6 +50,7 @@ ipblock cn disallow 1.2.3.4         # 移除例外
 ```bash
 ipblock wl add 3321 1.2.3.4 5.6.7.8 # 3321 只放行这两个 IP（可多次执行追加）
 ipblock wl add 19600 江西 1.2.3.4   # 19600 只放行江西省 IP 和 1.2.3.4
+ipblock wl add 28126 ddns.example.com # 放行动态域名当前解析到的 IP
 ipblock wl rm 3321 5.6.7.8          # 从名单移除 IP / 省份
 ipblock wl del 3321                 # 取消 3321 的白名单
 ```
@@ -58,6 +60,7 @@ ipblock wl del 3321                 # 取消 3321 的白名单
 ```bash
 ipblock status       # 查看端口、名单、IP 库和拦截计数
 ipblock update       # 立即更新大陆 / 省份 IP 库
+ipblock dns          # 立即重新解析白名单里的域名
 ipblock off          # 临时关闭（配置保留）
 ipblock on           # 按配置恢复
 ipblock import       # 导入并替换旧的 cn-port-block / port-allowlist
@@ -79,8 +82,8 @@ ipblock uninstall    # 删除全部规则、定时任务、配置和脚本
 ## 实现
 
 - nftables 表 `inet ipblock`，在 prerouting（priority -160）按目标端口跳到检查链：`cn` 链查大陆 IP 集合，`wl_<端口>` 链查该端口名单和省份集合 `prov_<代码>`；
-- 配置在 `/etc/ipblock/`：`cn.ports`、`cn.allow`、`wl.ports`、`wl/<端口>`，IP 库缓存 `cn4.txt` / `cn6.txt`、`prov/<代码>.txt`；
-- systemd：`ipblock.service`（开机恢复规则）、`ipblock-update.timer`（每周更新 IP 库）。
+- 配置在 `/etc/ipblock/`：`cn.ports`、`cn.allow`、`wl.ports`、`wl/<端口>`，IP 库缓存 `cn4.txt` / `cn6.txt`、`prov/<代码>.txt`，域名解析结果缓存 `dns/<域名>`；
+- systemd：`ipblock.service`（开机恢复规则）、`ipblock-update.timer`（每周更新 IP 库）、`ipblock-dns.timer`（名单里有域名时启用，每 5 分钟重新解析）。
 
 ## 从旧版升级
 

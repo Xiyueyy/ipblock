@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ipblock —— 按端口控制入站来源（nftables）：
 #   大陆屏蔽：指定端口丢弃中国大陆 IP 主动发起的连接，可放行大陆中转机等例外 IP
-#   端口白名单：指定端口只接受名单内 IP（或整个省份）的连接，每个端口一份名单
+#   端口白名单：指定端口只接受名单内 IP（或整个省份、域名）的连接，每个端口一份名单
 # 只看"连进来"的新连接（conntrack 方向），本机访问外部的回包、其他端口都不受影响。
 # 在 prerouting 阶段（DNAT 之前）匹配，裸机监听和 Docker 映射端口都能拦。
 set -Eeuo pipefail
@@ -18,6 +18,7 @@ CN6_FILE="${BASE_DIR}/cn6.txt"
 WL_PORTS="${BASE_DIR}/wl.ports"
 WL_DIR="${BASE_DIR}/wl"
 PROV_DIR="${BASE_DIR}/prov"
+DNS_DIR="${BASE_DIR}/dns"
 NFT_TABLE="ipblock"
 UNIT_DIR="/etc/systemd/system"
 
@@ -51,13 +52,14 @@ ${APP} ${VERSION} —— 按端口屏蔽大陆来源 / 只放行白名单 IP（n
   ${APP} cn disallow <IP>...       移除例外
 
 端口白名单：
-  ${APP} wl add <端口> <IP|省份>...  该端口只放行这些 IP / 省份（可多次执行追加）
-  ${APP} wl rm  <端口> <IP|省份>...  从该端口名单里移除
+  ${APP} wl add <端口> <IP|省份|域名>...  该端口只放行这些来源（可多次执行追加）
+  ${APP} wl rm  <端口> <IP|省份|域名>...  从该端口名单里移除
   ${APP} wl del <端口>...          取消该端口的白名单
 
 其他：
   ${APP} status                    查看配置、IP 库和拦截计数
   ${APP} update                    重新下载大陆 / 省份 IP 库并生效（已设每周自动更新）
+  ${APP} dns                       重新解析白名单里的域名，IP 变了就更新规则（有域名时每 5 分钟自动执行）
   ${APP} off / on                  临时关闭 / 按配置恢复（重启后自动恢复）
   ${APP} import                    导入并替换旧的 cn-port-block / port-allowlist
   ${APP} uninstall                 删除全部规则、定时任务和配置
@@ -65,6 +67,7 @@ ${APP} ${VERSION} —— 按端口屏蔽大陆来源 / 只放行白名单 IP（n
 端口写法：443、443/tcp、20000-20010/udp（不写协议 = TCP+UDP）
 IP 写法：1.2.3.4、1.2.3.0/24、2001:db8::/32
 省份写法：江西、广东省、内蒙古，或 6 位行政区划代码（如 360000 江西、360100 南昌），只含 IPv4
+域名写法：ddns.example.com（适合动态 IP，解析出的 IPv4 / IPv6 都放行）
 EOF
 }
 
@@ -170,9 +173,14 @@ wl_file() { echo "${WL_DIR}/$1"; }
 wl_id() { echo "${1//-/_}"; }
 wl_port_list() { read_list "$WL_PORTS" | awk '!seen[$1]++ { print $1 }'; }
 wl_has_port() { read_list "$WL_PORTS" | awk -v p="$1" '$1 == p { f = 1 } END { exit !f }'; }
-v4_only() { awk '/\./ && !/:/'; }
+v4_only() { awk '/^[0-9.\/]+$/'; }
 v6_only() { awk '/:/'; }
 prov_only() { awk '!/[.:]/'; }
+dom_only() { awk '/[A-Za-z]/ && /\./ && !/:/'; }
+
+valid_domain() {
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$ ]]
+}
 
 # 省份名 → 去掉"省/市/自治区"等后缀的简称；6 位代码原样返回；不认识返回失败
 prov_norm() {
@@ -200,6 +208,42 @@ prov_file() { echo "${PROV_DIR}/$(prov_code "$1").txt"; }
 used_provs() {
   local port
   for port in $(wl_port_list); do read_list "$(wl_file "$port")" | prov_only; done | awk '!seen[$0]++'
+}
+
+used_doms() {
+  local port
+  for port in $(wl_port_list); do read_list "$(wl_file "$port")" | dom_only; done | awk '!seen[$0]++'
+}
+
+dns_file() { echo "${DNS_DIR}/$1"; }
+
+# 解析全部域名写入缓存；解析失败沿用上次结果。有缓存变化时返回 0
+resolve_doms() {
+  local d f tmp changed=1
+  mkdir -p "$DNS_DIR"
+  for d in $(used_doms); do
+    f="$(dns_file "$d")"; tmp="$(mktemp)"
+    { timeout 10 getent ahostsv4 "$d" || true; timeout 10 getent ahostsv6 "$d" || true; } \
+      | awk '{ print $1 }' | grep -vE '^::ffff:' | sort -u >"$tmp"
+    if [ ! -s "$tmp" ]; then
+      [ -s "$f" ] && warn "域名 $d 解析失败，沿用上次结果：$(paste -sd' ' "$f")" || warn "域名 $d 解析失败，暂时没有可放行的 IP"
+      rm -f "$tmp"; continue
+    fi
+    if ! cmp -s "$tmp" "$f"; then
+      [ -s "$f" ] && info "域名 $d：$(paste -sd' ' "$f") → $(paste -sd' ' "$tmp")"
+      install -m 600 "$tmp" "$f"; changed=0
+    fi
+    rm -f "$tmp"
+  done
+  return "$changed"
+}
+
+# 端口名单展开成具体地址：IP 原样，域名换成缓存里的解析结果
+wl_addrs() {
+  local e
+  read_list "$(wl_file "$1")" | while read -r e; do
+    if valid_ip "$e"; then echo "$e"; elif valid_domain "$e"; then read_list "$(dns_file "$e")"; fi
+  done
 }
 
 # ---------- 大陆 IP 库 ----------
@@ -289,8 +333,8 @@ build_ruleset() {
   read_list "$CN_PORTS" | awk '$2=="udp" { print $1 }' | set_block cn_udp inet_service
   for port in $(wl_port_list); do
     id="$(wl_id "$port")"
-    read_list "$(wl_file "$port")" | v4_only | set_block "wl_${id}_4" ipv4_addr
-    read_list "$(wl_file "$port")" | v6_only | set_block "wl_${id}_6" ipv6_addr
+    wl_addrs "$port" | v4_only | awk '!seen[$0]++' | set_block "wl_${id}_4" ipv4_addr
+    wl_addrs "$port" | v6_only | awk '!seen[$0]++' | set_block "wl_${id}_6" ipv6_addr
   done
   for p in $(used_provs); do
     set_block "prov_$(prov_code "$p")" ipv4_addr <"$(prov_file "$p")"
@@ -335,6 +379,7 @@ apply_rules() {
   fi
   local p
   for p in $(used_provs); do [ -s "$(prov_file "$p")" ] || fetch_prov "$p"; done
+  [ -n "${DNS_RESOLVED:-}" ] || [ -z "$(used_doms)" ] || resolve_doms || true
   [ -e "$CN4_FILE" ] || : >"$CN4_FILE"
   [ -e "$CN6_FILE" ] || : >"$CN6_FILE"
 
@@ -400,9 +445,41 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  cat >"${UNIT_DIR}/${APP}-dns.service" <<EOF
+[Unit]
+Description=ipblock: re-resolve allowlist domains
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${BIN} dns
+EOF
+  cat >"${UNIT_DIR}/${APP}-dns.timer" <<EOF
+[Unit]
+Description=ipblock: re-resolve allowlist domains every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
   systemctl enable "${APP}.service" >/dev/null 2>&1 || true
   systemctl enable --now "${APP}-update.timer" >/dev/null 2>&1 || true
+  dns_timer_sync
+}
+
+# 名单里有域名才开每 5 分钟的重新解析
+dns_timer_sync() {
+  command -v systemctl >/dev/null 2>&1 && [ -f "${UNIT_DIR}/${APP}-dns.timer" ] || return 0
+  if [ -n "$(used_doms)" ]; then
+    systemctl enable --now "${APP}-dns.timer" >/dev/null 2>&1 || true
+  else
+    systemctl disable --now "${APP}-dns.timer" >/dev/null 2>&1 || true
+  fi
 }
 
 # ---------- 旧版迁移 ----------
@@ -526,10 +603,11 @@ cn_cmd() {
   show_status
 }
 
-# IP 原样返回，省份返回简称；都不是则报错
+# IP、域名原样返回，省份返回简称；都不是则报错
 wl_entry() {
   valid_ip "$1" && { echo "$1"; return 0; }
-  prov_norm "$1" || die "既不是 IP 也不是省份：$1"
+  valid_domain "$1" && { echo "$1" | tr 'A-Z' 'a-z'; return 0; }
+  prov_norm "$1" || die "不是 IP、域名或省份：$1"
 }
 
 wl_cmd() {
@@ -542,7 +620,7 @@ wl_cmd() {
       parse_port "$spec" >/dev/null; refuse_ssh "$port"
       for p in "$@"; do entries+=("$(wl_entry "$p")"); done
       for p in "${entries[@]}"; do
-        if ! valid_ip "$p" && [ ! -s "$(prov_file "$p")" ]; then fetch_prov "$p"; fi
+        if ! valid_ip "$p" && ! valid_domain "$p" && [ ! -s "$(prov_file "$p")" ]; then fetch_prov "$p"; fi
       done
       if wl_has_port "$port" && [[ "$spec" == */* ]]; then
         warn "端口 $port 已有白名单，协议以首次添加为准；要改协议请先 ${APP} wl del $port"
@@ -557,7 +635,7 @@ wl_cmd() {
       wl_has_port "$port" || die "端口 $port 没有白名单"
       for p in "$@"; do remove_line "$(wl_file "$port")" "$(wl_entry "$p")"; done
       [ -n "$(read_list "$(wl_file "$port")")" ] || warn "端口 $port 的名单已空，所有来源都会被拦截；不需要了请用 ${APP} wl del $port"
-      apply_rules ;;
+      apply_rules; dns_timer_sync ;;
     del)
       [ $# -gt 0 ] || die "请指定端口"
       for spec in "$@"; do
@@ -565,7 +643,7 @@ wl_cmd() {
         parse_port "$spec" | while read -r line; do remove_line "$WL_PORTS" "$line"; done
         wl_has_port "$port" || rm -f "$(wl_file "$port")"
       done
-      apply_rules ;;
+      apply_rules; dns_timer_sync ;;
     *) usage; exit 1 ;;
   esac
   show_status
@@ -601,7 +679,9 @@ show_status() {
   if [ -n "$(read_list "$WL_PORTS")" ]; then
     for port in $(wl_port_list); do
       ips="$(read_list "$(wl_file "$port")" | while read -r p; do
-        if valid_ip "$p"; then echo "$p"; else echo "${p}($(wc -l 2>/dev/null <"$(prov_file "$p")" || echo 0)段)"; fi
+        if valid_ip "$p"; then echo "$p"
+        elif valid_domain "$p"; then echo "${p}($(read_list "$(dns_file "$p")" | paste -sd, - | sed 's/^$/未解析/'))"
+        else echo "${p}($(wc -l 2>/dev/null <"$(prov_file "$p")" || echo 0)段)"; fi
       done | paste -sd' ' -)"
       printf '  %-12s 放行：%s' "$(read_list "$WL_PORTS" | awk -v p="$port" '$1 == p' | fmt_ports)" "${ips:-（无，全部拦截）}"
       [ "$active" -eq 1 ] && printf '  已拦截：%s 个包' "$(chain_drops "wl_$(wl_id "$port")")"
@@ -625,11 +705,16 @@ fetch_and_apply() {
   apply_rules
 }
 
+refresh_dns() {
+  [ -n "$(used_doms)" ] || { info "白名单里没有域名"; return 0; }
+  if resolve_doms; then DNS_RESOLVED=1 apply_rules; else info "域名解析结果没有变化"; fi
+}
+
 uninstall_all() {
   nft delete table inet "$NFT_TABLE" 2>/dev/null || true
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "${APP}-update.timer" "${APP}.service" >/dev/null 2>&1 || true
-    rm -f "${UNIT_DIR}/${APP}.service" "${UNIT_DIR}/${APP}-update.service" "${UNIT_DIR}/${APP}-update.timer"
+    systemctl disable --now "${APP}-update.timer" "${APP}-dns.timer" "${APP}.service" >/dev/null 2>&1 || true
+    rm -f "${UNIT_DIR}/${APP}.service" "${UNIT_DIR}/${APP}-update.service" "${UNIT_DIR}/${APP}-update.timer" "${UNIT_DIR}/${APP}-dns.service" "${UNIT_DIR}/${APP}-dns.timer"
     systemctl daemon-reload || true
   fi
   rm -rf "$BASE_DIR"
@@ -671,7 +756,7 @@ menu() {
  大陆屏蔽
   1) 添加端口            2) 删除端口
   3) 添加例外 IP         4) 移除例外 IP
- 端口白名单（只放行指定 IP / 省份）
+ 端口白名单（只放行指定 IP / 省份 / 域名）
   5) 添加端口 / IP       6) 移除 IP
   7) 取消某端口白名单
  其他
@@ -685,8 +770,8 @@ MENU
       2) ask "要取消屏蔽的端口" "" a; run cn_cmd del $a ;;
       3) ask "例外 IP（空格分隔）" "" a; run cn_cmd allow $a ;;
       4) ask "要移除的例外 IP" "" a; run cn_cmd disallow $a ;;
-      5) ask "端口" "" a; ask "放行的 IP 或省份（空格分隔，如 1.2.3.4 江西）" "" b; run wl_cmd add "$a" $b ;;
-      6) ask "端口" "" a; ask "要移除的 IP 或省份" "" b; run wl_cmd rm "$a" $b ;;
+      5) ask "端口" "" a; ask "放行的 IP、省份或域名（空格分隔，如 1.2.3.4 江西 ddns.example.com）" "" b; run wl_cmd add "$a" $b ;;
+      6) ask "端口" "" a; ask "要移除的 IP、省份或域名" "" b; run wl_cmd rm "$a" $b ;;
       7) ask "要取消白名单的端口" "" a; run wl_cmd del $a ;;
       8) run show_status ;;
       9) run fetch_and_apply ;;
@@ -715,6 +800,7 @@ main() {
     wl|allowlist) wl_cmd "$@" ;;
     status|list) show_status ;;
     update|update-all) fetch_and_apply ;;
+    dns) refresh_dns ;;
     on|apply) apply_rules ;;
     off) nft delete table inet "$NFT_TABLE" 2>/dev/null || true; info "已临时关闭（配置保留，执行 ${APP} on 恢复）" ;;
     import) import_old ;;
